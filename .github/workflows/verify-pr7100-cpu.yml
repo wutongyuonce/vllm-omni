@@ -1,0 +1,111 @@
+name: Verify PR 7100 CPU cleanup
+
+on:
+  push:
+    branches:
+      - 'verification/pr7100-cpu-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  engine-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: vllm/vllm-openai-cpu:v0.33.0-x86_64
+    defaults:
+      run:
+        shell: bash
+    env:
+      VLLM_TARGET_DEVICE: cpu
+      OMP_NUM_THREADS: '2'
+      VLLM_LOGGING_LEVEL: WARNING
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 12d6ac4e3ce932e13ce4cbc80a85ed2815b98b99
+          fetch-depth: 0
+      - name: Install Omni CPU and test dependencies
+        run: |
+          set -euo pipefail
+          python3 -m pip install uv
+          uv pip install --system --torch-backend cpu -r requirements/cpu.txt \
+            pytest==9.1.1 pytest-asyncio==1.4.0 pytest-mock==3.15.1 pytest-xdist==3.8.0
+          uv pip install --system --no-deps -e .
+          python3 - <<'PY'
+          import importlib.metadata as m
+          import platform
+          from pathlib import Path
+          versions = platform.platform() + '\n' + '\n'.join(
+              f'{name}=={m.version(name)}'
+              for name in ('vllm', 'torch', 'transformers', 'pytest', 'pytest-asyncio')
+          )
+          print(versions)
+          Path('verification-versions.txt').write_text(versions + '\n')
+          PY
+      - name: Run complete engine CPU suites on the repair
+        run: |
+          set -euo pipefail
+          python3 -m pytest -q \
+            tests/engine/test_orchestrator.py \
+            tests/engine/test_orchestrator_error_handling.py \
+            -m 'core_model and cpu' --run-level core_model \
+            --junitxml=engine-cpu.xml
+      - name: Prove the regression assertions fail on main
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+
+          target = Path('vllm_omni/engine/orchestrator.py')
+          fixed = target.read_bytes()
+          baseline = subprocess.check_output([
+              'git', 'show',
+              'f4b5a8a07b9b0fe505c589cdbb85a5abd558e918:vllm_omni/engine/orchestrator.py',
+          ])
+          tests = [
+              'tests/engine/test_orchestrator_error_handling.py::test_add_request_to_dead_stage_fails_request_not_server',
+              'tests/engine/test_orchestrator_error_handling.py::test_streaming_input_to_mrv2_downstream_stage_fails_with_client_error',
+              'tests/engine/test_orchestrator.py::test_explicit_run_request_detached_before_admission_returns_client_error',
+              'tests/engine/test_orchestrator.py::test_explicit_run_rejected_before_admission_releases_reservation',
+              'tests/engine/test_orchestrator.py::test_add_request_rejects_qwen3_omni_dflash_resumable_input',
+              'tests/engine/test_orchestrator.py::test_add_request_rejects_parallel_samples_on_a_watermarking_stage',
+              'tests/engine/test_orchestrator.py::test_add_request_rejects_parallel_samples_on_a_later_stage_before_submission',
+          ]
+          target.write_bytes(baseline)
+          try:
+              result = subprocess.run(
+                  [sys.executable, '-m', 'pytest', '-q', *tests,
+                   '-m', 'core_model and cpu', '--run-level', 'core_model',
+                   '--junitxml=baseline-engine-cpu.xml'],
+                  text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+          finally:
+              target.write_bytes(fixed)
+          Path('baseline-output.txt').write_text(result.stdout)
+          print(result.stdout)
+          cases = list(ET.parse('baseline-engine-cpu.xml').getroot().iter('testcase'))
+          failures = [case for case in cases if case.find('failure') is not None]
+          errors = [case for case in cases if case.find('error') is not None]
+          skipped = [case for case in cases if case.find('skipped') is not None]
+          assert result.returncode == 1, f'Expected main to fail the regressions, exit={result.returncode}'
+          assert len(cases) == 16, f'Expected 16 selected cases, found {len(cases)}'
+          assert not errors and not skipped, f'Unexpected collection/runtime errors or skips: {len(errors)}, {len(skipped)}'
+          assert len(failures) == 10, f'Expected the 10 rejection cases to expose leaks, found {len(failures)}'
+          print('Regression proof: main has 10 expected failures and 6 passing accepted-request cases; repaired suites passed in the preceding step.')
+          PY
+      - name: Upload exact verification results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr7100-cpu-results
+          path: |
+            verification-versions.txt
+            engine-cpu.xml
+            baseline-engine-cpu.xml
+            baseline-output.txt
+          if-no-files-found: warn
