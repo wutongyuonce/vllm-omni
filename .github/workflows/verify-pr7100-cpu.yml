@@ -20,6 +20,7 @@ jobs:
         shell: bash
     env:
       VLLM_TARGET_DEVICE: cpu
+      VERIFY_PYTHON: /opt/venv/bin/python
       OMP_NUM_THREADS: '2'
       VLLM_LOGGING_LEVEL: WARNING
     steps:
@@ -30,11 +31,26 @@ jobs:
       - name: Install Omni CPU and test dependencies
         run: |
           set -euo pipefail
-          python3 -m pip install uv
-          uv pip install --system --torch-backend cpu -r requirements/cpu.txt \
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          "$VERIFY_PYTHON" -m pip install uv
+          "$VERIFY_PYTHON" - <<'PY'
+          from importlib.metadata import PackageNotFoundError, version
+          from pathlib import Path
+          pins = []
+          for package in ('vllm', 'torch', 'torchvision', 'torchaudio'):
+              try:
+                  pins.append(f'{package}=={version(package)}')
+              except PackageNotFoundError:
+                  pass
+          Path('/tmp/pr7100-runtime-constraints.txt').write_text('\n'.join(pins) + '\n')
+          print('\n'.join(pins))
+          PY
+          "$VERIFY_PYTHON" -m uv pip install --python "$VERIFY_PYTHON" --torch-backend cpu \
+            -c /tmp/pr7100-runtime-constraints.txt -r requirements/cpu.txt \
+            'setuptools>=77.0.3,<81.0.0' wheel 'setuptools-scm>=8.0' \
             pytest==9.1.1 pytest-asyncio==1.4.0 pytest-mock==3.15.1 pytest-xdist==3.8.0
-          uv pip install --system --no-deps -e .
-          python3 - <<'PY'
+          "$VERIFY_PYTHON" -m uv pip install --python "$VERIFY_PYTHON" --no-deps --no-build-isolation -e .
+          "$VERIFY_PYTHON" - <<'PY'
           import importlib.metadata as m
           import platform
           from pathlib import Path
@@ -48,14 +64,14 @@ jobs:
       - name: Run complete engine CPU suites on the repair
         run: |
           set -euo pipefail
-          python3 -m pytest -q \
+          "$VERIFY_PYTHON" -m pytest -q \
             tests/engine/test_orchestrator.py \
             tests/engine/test_orchestrator_error_handling.py \
             -m 'core_model and cpu' --run-level core_model \
             --junitxml=engine-cpu.xml
       - name: Prove the regression assertions fail on main
         run: |
-          python3 - <<'PY'
+          "$VERIFY_PYTHON" - <<'PY'
           from pathlib import Path
           import subprocess
           import sys
